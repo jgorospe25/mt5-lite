@@ -14,6 +14,10 @@ Data sources (pick one):
 Usage:
   python mt5lite.py backtest --demo
   python mt5lite.py backtest --csv EURUSD_H1.csv --spread 0.00012 --lots 0.1
+  # realistic costs: spread + slippage (price units, paid on every fill incl. SL/TP)
+  # + commission (flat per lot per side, or --commission-pct of notional per side)
+  python mt5lite.py backtest --csv XAUUSD_H1.csv --strategy xau_donchian \
+      --spread 0.25 --slippage 0.05 --commission 3.5
   python mt5lite.py fetch --symbol EURUSD --tf H1 --bars 20000 --out EURUSD_H1.csv
   python mt5lite.py incubate --csv EURUSD_H1.csv --replay 0.2     # replay as if live
   python mt5lite.py incubate --symbol EURUSD --tf H1               # live via MT5 feed
@@ -231,7 +235,234 @@ class XauF7K08(XauF7):
         super().__init__(k=0.8, tp_r=2.0)
 
 
-STRATEGIES = {"sma_cross": SmaCross, "xau_donchian": XauDonchian, "xau_f7": XauF7, "xau_f7_k08": XauF7K08}
+class XauM5EmaPullback(Strategy):
+    """Research cycle #1 (2026-11-13). XAUUSD M5 EMA-pullback continuation,
+    filtered by H1 trend bias (EMA50 vs EMA200). Combines 2 concepts: EMA-pullback
+    trend continuation + higher-timeframe (H1) bias, per the IDEA SOURCES rotation.
+
+    Hypothesis: in a live London/NY session, when H1 trend bias is up (EMA50>EMA200)
+    and M5 price pulls back to touch the M5 EMA21 band then closes back above it in
+    the trend direction, momentum resumes (short-term liquidity re-entry near a fast
+    MA before the dominant HTF trend continues). Mirrored for downtrends.
+
+    No lookahead: the H1 bias used for M5 bar in hour H is from H1 bar H-1 (the last
+    FULLY CLOSED H1 bar as of any M5 bar inside the still-forming hour H) -- i.e. the
+    H1 bias is always known one calendar hour before being used. Entries fill at the
+    next M5 bar's open (engine-enforced)."""
+
+    name = "xau_m5_ema_pullback"
+    demo_base = 2000.0
+    # Vantage XAUUSD.sc: no commission, ~0.25 spread (same defaults as xau_donchian)
+    defaults = dict(contract=100.0, spread=0.25, commission=0.0, equity_pct=0.0)
+
+    def __init__(self, ema_fast=21, ema_slow=50, atr_n=14, h1_fast=50, h1_slow=200,
+                 sl_atr=1.2, tp_atr=2.0, be_trigger_atr=1.0, be_lock_atr=0.1,
+                 time_stop_bars=48, start_min=420, end_min=960, exit_min=960,
+                 max_trades_day=6, risk_pct=0.75, max_spread_frac=0.20,
+                 touch_band_atr=0.10):
+        self.ema_fast, self.ema_slow, self.atr_n = ema_fast, ema_slow, atr_n
+        self.h1_fast, self.h1_slow = h1_fast, h1_slow
+        self.sl_atr, self.tp_atr = sl_atr, tp_atr
+        self.be_trigger_atr, self.be_lock_atr = be_trigger_atr, be_lock_atr
+        self.time_stop_bars = time_stop_bars
+        self.start_min, self.end_min, self.exit_min = start_min, end_min, exit_min
+        self.max_trades_day, self.risk_pct = max_trades_day, risk_pct
+        self.max_spread_frac, self.touch_band_atr = max_spread_frac, touch_band_atr
+        # H1 EMA200 needs ~200 H1 bars = ~2400 M5 bars to converge; be generous.
+        self.warmup = max(h1_slow * 12 + 50, ema_slow + atr_n + 10)
+        self._cur_day, self._trades_today = None, 0
+        self._entry_i, self._entry_atr, self._be_done = None, 0.0, False
+
+    def prepare(self, df):
+        d = df.copy()
+        # --- M5 indicators (causal: rolling/ewm use rows <= i only) ---
+        d["ema_f"] = d.close.ewm(span=self.ema_fast, adjust=False).mean()
+        d["ema_s"] = d.close.ewm(span=self.ema_slow, adjust=False).mean()
+        pc = d.close.shift(1)
+        tr = pd.concat([d.high - d.low, (d.high - pc).abs(), (d.low - pc).abs()], axis=1).max(axis=1)
+        d["atr"] = tr.rolling(self.atr_n).mean()
+        # --- session / day, UTC (Vantage server time offset, same helper as xau_f7) ---
+        d["utc"] = d.time - pd.to_timedelta(_vantage_offset_hours(d.time), unit="h")
+        d["utcday"] = d.utc.dt.normalize()
+        d["mod"] = d.utc.dt.hour * 60 + d.utc.dt.minute
+        d["dow"] = d.utc.dt.day_of_week
+        # --- H1 bias from the M5 bars, using server-time hour buckets (matches MT5
+        # iMA(H1) which aligns to server-time hours, not UTC) ---
+        d["hour"] = d.time.dt.floor("h")
+        h1 = d.groupby("hour").agg(c=("close", "last")).reset_index().set_index("hour")
+        h1["ema_f"] = h1.c.ewm(span=self.h1_fast, adjust=False).mean()
+        h1["ema_s"] = h1.c.ewm(span=self.h1_slow, adjust=False).mean()
+        # shift(1): the bar at hour H is still forming for any M5 bar inside hour H,
+        # so the last CLOSED H1 bar for hour H is H-1's row.
+        h1s = h1[["ema_f", "ema_s"]].shift(1)
+        d["h1up"] = d.hour.map(h1s.ema_f > h1s.ema_s)
+        d["h1dn"] = d.hour.map(h1s.ema_f < h1s.ema_s)
+        return d
+
+    def signal(self, df, i, pos=None):
+        c, o, hi, lo = df.close.iat[i], df.open.iat[i], df.high.iat[i], df.low.iat[i]
+        ema_f, ema_s, atr = df.ema_f.iat[i], df.ema_s.iat[i], df.atr.iat[i]
+        h1up, h1dn = df.h1up.iat[i], df.h1dn.iat[i]
+        day, mod, dow = df.utcday.iat[i], df["mod"].iat[i], df.dow.iat[i]
+        if day != self._cur_day:
+            self._cur_day, self._trades_today = day, 0
+        if np.isnan([ema_f, ema_s, atr]).any() or atr <= 0 or pd.isna(h1up) or i < 2:
+            return None
+
+        # --- manage an open position: time stop, session-end close, breakeven ratchet ---
+        if pos is not None:
+            bars_held = (i - self._entry_i) if self._entry_i is not None else 0
+            if bars_held >= self.time_stop_bars or mod >= self.exit_min or dow >= 5:
+                return Signal(0)
+            if not self._be_done and bars_held >= 1 and self._entry_atr > 0:
+                entry = pos.entry
+                if pos.side > 0 and (c - entry) >= self.be_trigger_atr * self._entry_atr:
+                    self._be_done = True
+                    return Signal(None, move_sl=entry + self.be_lock_atr * self._entry_atr)
+                if pos.side < 0 and (entry - c) >= self.be_trigger_atr * self._entry_atr:
+                    self._be_done = True
+                    return Signal(None, move_sl=entry - self.be_lock_atr * self._entry_atr)
+            return None
+
+        # --- entries: session + day-trade-cap gate, then H1-bias + M5 pullback ---
+        if dow >= 5 or mod < self.start_min or mod >= self.end_min:
+            return None
+        if self._trades_today >= self.max_trades_day:
+            return None
+        lows3 = df.low.iloc[i - 2:i + 1]
+        highs3 = df.high.iloc[i - 2:i + 1]
+        band = self.touch_band_atr * atr
+        touched_up = lows3.min() <= ema_f + band  # dipped to/through the fast EMA band
+        touched_dn = highs3.max() >= ema_f - band
+        resume_long = c > ema_f and c > ema_s and c > o and c > df.close.iat[i - 1]
+        resume_short = c < ema_f and c < ema_s and c < o and c < df.close.iat[i - 1]
+
+        if h1up and touched_up and resume_long:
+            self._entry_i, self._entry_atr, self._be_done = i + 1, atr, False
+            self._trades_today += 1
+            return Signal(+1, sl=self.sl_atr * atr, tp=self.tp_atr * atr,
+                          risk_pct=self.risk_pct, max_spread_frac=self.max_spread_frac)
+        if h1dn and touched_dn and resume_short:
+            self._entry_i, self._entry_atr, self._be_done = i + 1, atr, False
+            self._trades_today += 1
+            return Signal(-1, sl=self.sl_atr * atr, tp=self.tp_atr * atr,
+                          risk_pct=self.risk_pct, max_spread_frac=self.max_spread_frac)
+        return None
+
+
+class XauM5VwapReversion(Strategy):
+    """Research cycle #2 (2026-11-13). XAUUSD M5 anchored-VWAP mean-reversion scalp,
+    gated by an ATR volatility-regime filter. Genuinely different mechanism from
+    cycle #1 (mean reversion, not trend continuation): combines 2 concepts --
+    session-anchored VWAP std-dev bands (mean reversion) + ATR14/ATR100 regime
+    filter (to sit out abnormal-volatility "trend days", per web research showing
+    VWAP-band fades are the "biggest mistake" on trend days: NexusFi VWAP write-up,
+    DEV Community VWAP+volatility-filter strategy).
+
+    Hypothesis: during normal (non-trending) volatility regimes, gold M5 price that
+    wicks through the -2sigma/+2sigma band of the day's anchored VWAP and closes back
+    inside it is exhausted and reverts toward VWAP before the session ends.
+
+    No lookahead: VWAP/std are cumulative-sum-to-bar-i only (reset each UTC day);
+    ATR14/ATR100 are trailing rolling means; the regime ratio and bands at bar i use
+    only bars <= i. Entries fill at the next M5 bar's open (engine-enforced)."""
+
+    name = "xau_m5_vwap_reversion"
+    demo_base = 2000.0
+    defaults = dict(contract=100.0, spread=0.25, commission=0.0, equity_pct=0.0)
+
+    def __init__(self, atr_n=14, atr_base_n=100, regime_max=1.3, band_sigma=2.0,
+                 be_sigma=1.0, sl_atr_buffer=0.3, min_rr=1.2, time_stop_bars=24,
+                 start_min=480, end_min=1200, max_trades_day=8, risk_pct=0.5,
+                 max_spread_frac=0.15):
+        self.atr_n, self.atr_base_n, self.regime_max = atr_n, atr_base_n, regime_max
+        self.band_sigma, self.be_sigma = band_sigma, be_sigma
+        self.sl_atr_buffer, self.min_rr = sl_atr_buffer, min_rr
+        self.time_stop_bars = time_stop_bars
+        self.start_min, self.end_min = start_min, end_min
+        self.max_trades_day, self.risk_pct, self.max_spread_frac = max_trades_day, risk_pct, max_spread_frac
+        self.warmup = atr_base_n + 20
+        self._cur_day, self._trades_today = None, 0
+        self._entry_i, self._entry_1sig, self._be_done = None, 0.0, False
+
+    def prepare(self, df):
+        d = df.copy()
+        d["utc"] = d.time - pd.to_timedelta(_vantage_offset_hours(d.time), unit="h")
+        d["utcday"] = d.utc.dt.normalize()
+        d["mod"] = d.utc.dt.hour * 60 + d.utc.dt.minute
+        d["dow"] = d.utc.dt.day_of_week
+        vol = d.get("tick_volume", pd.Series(1.0, index=d.index)).astype(float).clip(lower=1.0)
+        tp = (d.high + d.low + d.close) / 3.0
+        cum_v = vol.groupby(d.utcday).cumsum()
+        cum_vtp = (vol * tp).groupby(d.utcday).cumsum()
+        cum_vtp2 = (vol * tp * tp).groupby(d.utcday).cumsum()
+        d["vwap"] = cum_vtp / cum_v
+        var = (cum_vtp2 / cum_v - d["vwap"] ** 2).clip(lower=0.0)
+        d["vwap_std"] = np.sqrt(var)
+        d["up2"] = d.vwap + self.band_sigma * d.vwap_std
+        d["dn2"] = d.vwap - self.band_sigma * d.vwap_std
+        d["up1"] = d.vwap + self.be_sigma * d.vwap_std
+        d["dn1"] = d.vwap - self.be_sigma * d.vwap_std
+        pc = d.close.shift(1)
+        tr = pd.concat([d.high - d.low, (d.high - pc).abs(), (d.low - pc).abs()], axis=1).max(axis=1)
+        d["atr"] = tr.rolling(self.atr_n).mean()
+        d["atr_base"] = tr.rolling(self.atr_base_n).mean()
+        d["regime"] = d.atr / d.atr_base
+        return d
+
+    def signal(self, df, i, pos=None):
+        c, o, hi, lo = df.close.iat[i], df.open.iat[i], df.high.iat[i], df.low.iat[i]
+        vwap, up1, dn1, up2, dn2 = (df[k].iat[i] for k in ("vwap", "up1", "dn1", "up2", "dn2"))
+        atr, regime = df.atr.iat[i], df.regime.iat[i]
+        day, mod, dow = df.utcday.iat[i], df["mod"].iat[i], df.dow.iat[i]
+        if day != self._cur_day:
+            self._cur_day, self._trades_today = day, 0
+        if np.isnan([vwap, up2, dn2, atr, regime]).any() or atr <= 0:
+            return None
+
+        if pos is not None:
+            bars_held = (i - self._entry_i) if self._entry_i is not None else 0
+            if bars_held >= self.time_stop_bars or mod >= self.end_min or dow >= 5:
+                return Signal(0)
+            if not self._be_done and bars_held >= 1:
+                if pos.side > 0 and c >= self._entry_1sig:
+                    self._be_done = True
+                    return Signal(None, move_sl=pos.entry + 0.05 * atr)
+                if pos.side < 0 and c <= self._entry_1sig:
+                    self._be_done = True
+                    return Signal(None, move_sl=pos.entry - 0.05 * atr)
+            return None
+
+        if dow >= 5 or mod < self.start_min or mod >= self.end_min:
+            return None
+        if self._trades_today >= self.max_trades_day:
+            return None
+        if regime > self.regime_max:  # abnormal-volatility "trend day" -- sit out
+            return None
+
+        long_sig = lo <= dn2 and c > dn2 and c > o
+        short_sig = hi >= up2 and c < up2 and c < o
+        if long_sig:
+            sl_dist = (c - lo) + self.sl_atr_buffer * atr
+            tp_dist = vwap - c
+            if sl_dist > 0 and tp_dist >= self.min_rr * sl_dist:
+                self._entry_i, self._entry_1sig, self._be_done = i + 1, up1, False
+                self._trades_today += 1
+                return Signal(+1, sl=sl_dist, tp=tp_dist, risk_pct=self.risk_pct,
+                              max_spread_frac=self.max_spread_frac)
+        if short_sig:
+            sl_dist = (hi - c) + self.sl_atr_buffer * atr
+            tp_dist = c - vwap
+            if sl_dist > 0 and tp_dist >= self.min_rr * sl_dist:
+                self._entry_i, self._entry_1sig, self._be_done = i + 1, dn1, False
+                self._trades_today += 1
+                return Signal(-1, sl=sl_dist, tp=tp_dist, risk_pct=self.risk_pct,
+                              max_spread_frac=self.max_spread_frac)
+        return None
+
+
+STRATEGIES = {"sma_cross": SmaCross, "xau_donchian": XauDonchian, "xau_f7": XauF7, "xau_f7_k08": XauF7K08,
+              "xau_m5_ema_pullback": XauM5EmaPullback, "xau_m5_vwap_reversion": XauM5VwapReversion}
 
 # ----------------------------------------------------------------------------
 # Broker / engine (shared by backtest and incubation)
@@ -258,6 +489,7 @@ class Broker:
     lots: float = 0.1
     contract: float = 100_000.0  # units per lot (FX = 100k)
     spread: float = 0.0  # full spread in price units, paid on entry (ask = mid+spread)
+    slippage: float = 0.0  # price units lost per fill (entry, exit, SL/TP) vs the requested price
     commission: float = 0.0  # per lot, per side, account currency
     commission_pct: float = 0.0  # % of notional per side (TradingView style), e.g. 0.02
     equity_pct: float = 0.0  # >0: size = equity*pct% / (price*contract), 0.01 step; else fixed lots
@@ -273,8 +505,9 @@ class Broker:
         return round(max(lots, 0.01), 2)
 
     def _close(self, t, price, time_, reason):
-        # longs exit at bid (= price), shorts exit at ask (= price + spread)
-        px = price if t.side > 0 else price + self.spread
+        # longs exit at bid (= price), shorts exit at ask (= price + spread); slippage
+        # always costs the trader, on top of the spread (SL/TP fills included)
+        px = price - self.slippage if t.side > 0 else price + self.spread + self.slippage
         t.exit, t.exit_time, t.reason = px, time_, reason
         t.pnl = ((px - t.entry) * t.side * t.lots * self.contract - 2 * self.commission * t.lots
                  - self.commission_pct / 100 * (t.entry + px) * t.lots * self.contract)
@@ -296,7 +529,8 @@ class Broker:
                 if self.pos is not None and self.pos.side != p.direction:
                     self._close(self.pos, o, ts, "exit" if p.direction == 0 else "reverse")
                 if p.direction != 0 and self.pos is None:
-                    entry = o + self.spread if p.direction > 0 else o
+                    # buy fills pay spread+slippage, sell fills lose slippage
+                    entry = o + self.spread + self.slippage if p.direction > 0 else o - self.slippage
                     sl = p.sl_abs or (entry - p.direction * p.sl if p.sl else 0.0)
                     tp = p.tp_abs or (entry + p.direction * p.tp if p.tp else 0.0)
                     dist = abs(entry - sl) if sl else 0.0
@@ -440,7 +674,7 @@ def make_broker(a) -> Broker:
     d = STRATEGIES[a.strategy].defaults  # strategy's market defaults, CLI flags override
     g = lambda k, fallback: getattr(a, k) if getattr(a, k) is not None else d.get(k, fallback)
     return Broker(balance=a.balance, lots=a.lots, contract=g("contract", 100_000.0), spread=g("spread", 0.0001),
-                  commission=g("commission", 3.5), equity_pct=g("equity_pct", 0.0),
+                  slippage=g("slippage", 0.0), commission=g("commission", 3.5), equity_pct=g("equity_pct", 0.0),
                   commission_pct=a.commission_pct or 0.0)
 
 
@@ -550,6 +784,9 @@ def main():
         sp.add_argument("--lots", type=float, default=0.1)
         sp.add_argument("--contract", type=float, help="units per lot (default: strategy's, else 100000)")
         sp.add_argument("--spread", type=float, help="price units (default: strategy's, else 0.0001)")
+        sp.add_argument("--slippage", type=float,
+                         help="price units lost on every fill incl. SL/TP (default: strategy's, else 0). "
+                              "E.g. for XAUUSD.sc (point 0.01) 3 points of slippage is --slippage 0.03")
         sp.add_argument("--commission", type=float, help="per lot per side (default: strategy's, else 3.5)")
         sp.add_argument("--commission-pct", type=float, dest="commission_pct", help="%% of notional per side, e.g. 0.02")
         sp.add_argument("--start", help="only trade from this date (earlier bars used as warmup), e.g. 2025-09-22")
