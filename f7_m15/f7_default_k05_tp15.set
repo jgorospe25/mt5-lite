@@ -1,0 +1,13 @@
+; F7 volatility breakout, default k=0.5, TP 1.5R (as originally tested), true 1% risk
+InpK=0.5
+InpStartMin=120
+InpEndMin=1080
+InpExitMin=1260
+InpTpR=1.5
+InpMaxRiskPR=1.0
+InpMagic=26111307
+InpMaxSpreadFracR=0.10
+InpRiskPercent=1.0
+InpCapNoLeverage=false
+InpVantageDst=true
+InpUtcOffsetHours=0

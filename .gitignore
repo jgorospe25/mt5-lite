@@ -1,0 +1,17 @@
+# environment / caches
+.venv/
+__pycache__/
+*.pyc
+
+# runtime data (regenerate with `mt5lite.py fetch` or the GUI)
+instances/
+gui_settings.json
+*.csv
+*.pkl
+*.tmp
+
+# compiled MQL5 binaries (build from the .mq5 source)
+*.ex5
+
+# local-only helper with a hard-coded machine path
+f7_m15/gen_f7.py

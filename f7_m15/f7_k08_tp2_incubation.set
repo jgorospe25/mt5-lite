@@ -1,0 +1,13 @@
+; F7 volatility breakout, k=0.8, TP 2R (best in both sweep windows, chosen after seeing the sweep), true 1% risk
+InpK=0.8
+InpStartMin=120
+InpEndMin=1080
+InpExitMin=1260
+InpTpR=2.0
+InpMaxRiskPR=1.0
+InpMagic=26111307
+InpMaxSpreadFracR=0.10
+InpRiskPercent=1.0
+InpCapNoLeverage=false
+InpVantageDst=true
+InpUtcOffsetHours=0

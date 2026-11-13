@@ -1,0 +1,50 @@
+//@version=6
+// XAUUSD H1 - Donchian 20 breakout, EMA200 filter, 10-bar opposite channel exit, ATR stop/trail
+strategy("XAU H1 Donchian Breakout", overlay=true, pyramiding=1, process_orders_on_close=true, commission_type=strategy.commission.percent, commission_value=0.02, initial_capital=10000, default_qty_type=strategy.percent_of_equity, default_qty_value=100, margin_long=100, margin_short=100)
+
+entryLen = input.int(20, "Entry channel")
+exitLen = input.int(10, "Exit channel")
+filtLen = input.int(200, "Trend EMA")
+atrLen = input.int(14, "ATR length")
+slMult = input.float(2.0, "SL ATR mult")
+trailMult = input.float(3.0, "Trail ATR mult")
+
+upper = ta.highest(high, entryLen)[1]
+lower = ta.lowest(low, entryLen)[1]
+exitUp = ta.highest(high, exitLen)[1]
+exitDn = ta.lowest(low, exitLen)[1]
+filt = ta.ema(close, filtLen)
+atr = ta.atr(atrLen)
+
+longEntry = close > upper and close > filt and strategy.position_size <= 0
+shortEntry = close < lower and close < filt and strategy.position_size >= 0
+
+var float longTrail = na
+var float shortTrail = na
+
+if strategy.position_size > 0 and close < exitDn
+    strategy.close("L")
+if strategy.position_size < 0 and close > exitUp
+    strategy.close("S")
+
+if longEntry
+    strategy.entry("L", strategy.long)
+    longTrail := close - atr * slMult
+    strategy.exit("LX", from_entry="L", stop=longTrail)
+if shortEntry
+    strategy.entry("S", strategy.short)
+    shortTrail := close + atr * slMult
+    strategy.exit("SX", from_entry="S", stop=shortTrail)
+
+if strategy.position_size > 0 and not longEntry
+    newLong = close - atr * trailMult
+    longTrail := na(longTrail) ? newLong : math.max(longTrail, newLong)
+    strategy.exit("LX", from_entry="L", stop=longTrail)
+if strategy.position_size < 0 and not shortEntry
+    newShort = close + atr * trailMult
+    shortTrail := na(shortTrail) ? newShort : math.min(shortTrail, newShort)
+    strategy.exit("SX", from_entry="S", stop=shortTrail)
+
+plot(upper, title="Donchian upper")
+plot(lower, title="Donchian lower")
+plot(filt, title="EMA trend")

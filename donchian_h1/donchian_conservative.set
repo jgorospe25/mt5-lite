@@ -1,0 +1,9 @@
+; Donchian 20 breakout, same rules but only 25% of equity per trade (smaller drawdowns, slower growth)
+InpEntryChannel=20
+InpExitChannel=10
+InpTrendEMA=200
+InpAtrPeriod=14
+InpSlAtrMult=2.0
+InpTrailAtrMult=3.0
+InpEquityPercent=25.0
+InpMagic=26111202

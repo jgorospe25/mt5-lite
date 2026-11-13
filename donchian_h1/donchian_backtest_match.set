@@ -1,0 +1,9 @@
+; Donchian 20 breakout, same inputs as the $100 backtest (100% of equity per trade, no leverage)
+InpEntryChannel=20
+InpExitChannel=10
+InpTrendEMA=200
+InpAtrPeriod=14
+InpSlAtrMult=2.0
+InpTrailAtrMult=3.0
+InpEquityPercent=100.0
+InpMagic=26111202
